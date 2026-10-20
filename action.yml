@@ -1,0 +1,76 @@
+name: Green fork sync
+description: Fast-forward your forks to the newest upstream commit whose CI checks all passed.
+author: zuujiscom
+branding:
+  icon: git-branch
+  color: green
+
+inputs:
+  token:
+    description: Token that can write to the forks (Contents and Workflows read and write). Not the default GITHUB_TOKEN.
+    required: true
+  upstream-owner:
+    description: User or organization that owns the original repositories.
+    required: true
+  fork-owner:
+    description: User or organization that owns the forks.
+    default: ${{ github.repository_owner }}
+  repos:
+    description: Repository names (same name upstream and in the fork), one per line or comma-separated.
+    default: ""
+  repos-file:
+    description: Path to a file with repository names, one per line (# comments allowed). Used with or instead of `repos`.
+    default: ""
+  branch:
+    description: Upstream branch to follow.
+    default: main
+  fork-branch:
+    description: Branch in the fork to move. Defaults to `branch`.
+    default: ""
+  min-age-minutes:
+    description: Ignore upstream commits newer than this, so every workflow has started.
+    default: "10"
+  lookback:
+    description: How many recent upstream commits to consider (max 100).
+    default: "40"
+  ignore-checks:
+    description: Check-run names to ignore (one per line or comma-separated, * wildcards), e.g. flaky jobs.
+    default: ""
+  require-checks:
+    description: Check-run names that must be present and green (same format).
+    default: ""
+  dry-run:
+    description: Only report what would move.
+    default: "false"
+  status-file:
+    description: Also write the result table to this Markdown file.
+    default: ""
+
+outputs:
+  moved:
+    description: Number of forks that were moved.
+    value: ${{ steps.sync.outputs.moved }}
+  failed:
+    description: Number of repositories that hit an error.
+    value: ${{ steps.sync.outputs.failed }}
+
+runs:
+  using: composite
+  steps:
+    - id: sync
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        SYNC_UPSTREAM: ${{ inputs.upstream-owner }}
+        SYNC_FORK: ${{ inputs.fork-owner }}
+        SYNC_REPOS: ${{ inputs.repos }}
+        SYNC_REPOS_FILE: ${{ inputs.repos-file }}
+        SYNC_BRANCH: ${{ inputs.branch }}
+        SYNC_FORK_BRANCH: ${{ inputs.fork-branch }}
+        SYNC_MIN_AGE: ${{ inputs.min-age-minutes }}
+        SYNC_LOOKBACK: ${{ inputs.lookback }}
+        SYNC_IGNORE_CHECKS: ${{ inputs.ignore-checks }}
+        SYNC_REQUIRE_CHECKS: ${{ inputs.require-checks }}
+        SYNC_DRY_RUN: ${{ inputs.dry-run }}
+        SYNC_STATUS_FILE: ${{ inputs.status-file }}
+      run: python3 "$GITHUB_ACTION_PATH/sync.py"
