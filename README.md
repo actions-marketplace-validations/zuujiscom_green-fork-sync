@@ -1,5 +1,7 @@
 # Green fork sync
 
+[![CI](https://github.com/zuujiscom/green-fork-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/zuujiscom/green-fork-sync/actions/workflows/ci.yml)
+
 A GitHub Action that keeps your forks up to date with their upstream repositories, but only
 moves a fork to an upstream commit **after every CI check on that commit has passed**.
 
@@ -154,6 +156,9 @@ python3 sync.py --upstream some-org --fork you --dry-run first-repo second-repo
 ```
 
 `python3 sync.py --help` lists every option; they match the action inputs.
+
+To work on the action itself, run the offline tests with
+`python3 -m unittest discover -s tests -v` (see [CLAUDE.md](CLAUDE.md) for the details).
 
 ## License
 

@@ -168,7 +168,8 @@ def main():
     c.lookback = max(1, min(c.lookback, 100))
     repos = c.repos or split_list(env("SYNC_REPOS"))
     if c.repos_file:
-        repos += split_list(open(c.repos_file).read())
+        with open(c.repos_file) as f:
+            repos += split_list(f.read())
     if not repos:
         ap.error("no repos given (arguments, SYNC_REPOS or --repos-file)")
 

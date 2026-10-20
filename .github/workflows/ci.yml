@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "40 6 * * 1"   # weekly, to notice GitHub API changes
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.12", "3.x"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile
+        run: python -m py_compile sync.py
+      - name: Unit tests
+        run: python -W error::ResourceWarning -m unittest discover -s tests -v
+      - name: CLI help
+        run: python sync.py --help > /dev/null
+
+  dry-run:
+    # Runs the action itself, read-only, against real public repos.
+    name: Dry run of the action
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v5
+      - id: sync
+        uses: ./
+        with:
+          token: ${{ github.token }}   # read-only is enough for a dry run of public repos
+          upstream-owner: storytold
+          fork-owner: zuujiscom
+          repos: |
+            craft-fonts
+            photocraft
+          dry-run: "true"
+      - name: Check outputs
+        run: test "${{ steps.sync.outputs.failed }}" = "0" && test -n "${{ steps.sync.outputs.moved }}"

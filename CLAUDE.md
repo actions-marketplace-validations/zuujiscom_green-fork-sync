@@ -11,6 +11,7 @@ checks all passed. Users call it from their own workflow with `uses: zuujiscom/g
   environment variable and runs `python3 "$GITHUB_ACTION_PATH/sync.py"`.
 - `sync.py`: all the logic. Every option works as a CLI flag and as a `SYNC_*` variable.
 - `README.md`: the user-facing setup guide and inputs table.
+- `tests/test_sync.py`: offline tests; `.github/workflows/ci.yml`: CI.
 
 ## Rules
 
@@ -31,25 +32,36 @@ checks all passed. Users call it from their own workflow with `uses: zuujiscom/g
 
 ## Testing
 
-There are no unit tests yet. Test against real public repos with a dry run, which only
-reads the API (needs `gh auth login`):
+Offline unit tests (no network, no token) replace the GitHub API with an in-memory fake:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Add a test for every behaviour change: the fake in `tests/test_sync.py` (`FakeGitHub`)
+models commits with parents, check runs, commit statuses, compare and the ref update.
+`MetadataTests` fail if `action.yml`, the `SYNC_*` variables in `sync.py` and the README
+inputs table drift apart, so update all three together.
+
+`.github/workflows/ci.yml` runs the tests on Python 3.9, 3.12 and the latest 3.x for every
+push and PR (and weekly), then runs the action itself as a read-only dry run against real
+public repos. To try the real API by hand (needs `gh auth login`; reads only):
 
 ```bash
 python3 sync.py --upstream <owner> --fork <your-account> --dry-run <repo> [<repo>...]
-python3 sync.py --help
 ```
 
-Pick an upstream with active CI, so you see moved, waiting and up-to-date cases. Before
-any run without `--dry-run`, make sure the forks are ones you're allowed to change.
-Check that the argument errors still work (no `--upstream`, no repos).
+Before any run without `--dry-run`, make sure the forks are ones you're allowed to change.
 
 ## Releasing
 
-Tags follow semver. After changes are on `main` and tested:
+Tags follow semver. After changes are on `main` and CI is green:
 
 ```bash
 git tag -a v1.2.3 -m "v1.2.3" && git push origin v1.2.3
 git tag -f -a v1 -m "v1" && git push -f origin v1   # move the major tag users pin to
 ```
 
-Breaking input changes need a new major tag (`v2`), never a moved `v1`.
+Then create a GitHub release from the new tag (keep "Publish this Action to the GitHub
+Marketplace" ticked) so the Marketplace listing shows it. Breaking input changes need a new
+major tag (`v2`), never a moved `v1`.
