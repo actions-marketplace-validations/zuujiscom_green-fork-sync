@@ -6,7 +6,8 @@ itself pointed at, not commits from merged PR branches) and pick the newest comm
   - is at least --min-age minutes old, so every workflow has had time to start,
   - has at least one check run or commit status,
   - has every check run finished as success, skipped or neutral (nothing failed,
-    cancelled, timed out or still running), ignoring names matched by --ignore-check,
+    cancelled, timed out or still running), ignoring names matched by --ignore-check and
+    runs of workflows started by an --ignore-event (for example nightly `schedule` runs),
   - has a combined commit status of success, if it has any statuses.
 The fork's branch is then fast-forwarded to it. Nothing is ever force-pushed: a fork with
 commits of its own is reported and left alone.
@@ -59,6 +60,12 @@ class Syncer:
                 break
             page += 1
         runs = [c for c in runs if not any(fnmatch.fnmatch(c["name"], p) for p in self.c.ignore_checks)]
+        if self.c.ignore_events:
+            # A nightly workflow on the branch tip adds its check runs to a commit that was
+            # already green on push; leave runs from the ignored events out.
+            got = api(f"repos/{up}/{repo}/actions/runs?head_sha={sha}&per_page=100")
+            skip = {w["check_suite_id"] for w in got["workflow_runs"] if w["event"] in self.c.ignore_events}
+            runs = [c for c in runs if c.get("check_suite", {}).get("id") not in skip]
         status = api(f"repos/{up}/{repo}/commits/{sha}/status")
         if not runs and status["total_count"] == 0:
             return False, "no checks"
@@ -159,6 +166,8 @@ def main():
                     help="check-run name pattern to ignore (repeatable, * wildcards)")
     ap.add_argument("--require-check", dest="require_checks", action="append", default=split_list(env("SYNC_REQUIRE_CHECKS")),
                     help="check-run name pattern that must be present (repeatable)")
+    ap.add_argument("--ignore-event", dest="ignore_events", action="append", default=split_list(env("SYNC_IGNORE_EVENTS")),
+                    help="leave out check runs of workflows started by this event, e.g. schedule (repeatable)")
     ap.add_argument("--dry-run", action="store_true", default=(env("SYNC_DRY_RUN") or "").lower() == "true")
     ap.add_argument("--status", default=env("SYNC_STATUS_FILE") or "", help="write a Markdown status table here")
     c = ap.parse_args()

@@ -39,6 +39,9 @@ inputs:
   require-checks:
     description: Check-run names that must be present and green (same format).
     default: ""
+  ignore-events:
+    description: Leave out check runs of workflows started by these events (same format), e.g. `schedule` for nightly jobs.
+    default: ""
   dry-run:
     description: Only report what would move.
     default: "false"
@@ -71,6 +74,7 @@ runs:
         SYNC_LOOKBACK: ${{ inputs.lookback }}
         SYNC_IGNORE_CHECKS: ${{ inputs.ignore-checks }}
         SYNC_REQUIRE_CHECKS: ${{ inputs.require-checks }}
+        SYNC_IGNORE_EVENTS: ${{ inputs.ignore-events }}
         SYNC_DRY_RUN: ${{ inputs.dry-run }}
         SYNC_STATUS_FILE: ${{ inputs.status-file }}
       run: python3 "$GITHUB_ACTION_PATH/sync.py"

@@ -20,8 +20,9 @@ def read(name):
         return f.read()
 
 
-def run(name, conclusion="success", status="completed"):
-    return {"name": name, "status": status, "conclusion": conclusion if status == "completed" else None}
+def run(name, conclusion="success", status="completed", suite=1):
+    return {"name": name, "status": status, "conclusion": conclusion if status == "completed" else None,
+            "check_suite": {"id": suite}}
 
 
 class FakeGitHub:
@@ -34,6 +35,7 @@ class FakeGitHub:
         self.fork_sha = fork_sha
         self.checks = {}      # sha -> list of check runs
         self.statuses = {}    # sha -> (state, count)
+        self.workflow_runs = {}  # sha -> list of (check suite id, event)
         self.patches = []
         self.patch_error = None
 
@@ -64,6 +66,9 @@ class FakeGitHub:
         if m := re.fullmatch(r"repos/up/r/commits/(\w+)/check-runs\?per_page=100&page=(\d+)&filter=latest", path):
             runs, page = self.checks.get(m[1], []), int(m[2])
             return reply({"check_runs": runs[(page - 1) * 100:page * 100]})
+        if m := re.fullmatch(r"repos/up/r/actions/runs\?head_sha=(\w+)&per_page=100", path):
+            return reply({"workflow_runs": [{"check_suite_id": i, "event": e}
+                                            for i, e in self.workflow_runs.get(m[1], [])]})
         if m := re.fullmatch(r"repos/up/r/commits/(\w+)/status", path):
             state, count = self.statuses.get(m[1], ("pending", 0))
             return reply({"state": state, "total_count": count})
@@ -80,7 +85,7 @@ class FakeGitHub:
 
 def cfg(**kw):
     base = dict(upstream="up", fork="fork", branch="main", fork_branch="main", min_age=10,
-                lookback=40, ignore_checks=[], require_checks=[], dry_run=False)
+                lookback=40, ignore_checks=[], require_checks=[], ignore_events=[], dry_run=False)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -152,6 +157,19 @@ class SyncTests(unittest.TestCase):
     def test_only_ignored_checks_counts_as_no_checks(self):
         self.gh.checks = {"c3": [run("Dependabot")]}
         self.assertIn("no checks", self.sync(ignore_checks=["Dependabot"])[0])
+
+    def test_ignore_events_drops_scheduled_runs(self):
+        # c3 was green on push, then a nightly run on the branch tip failed / is still running
+        self.gh.checks = {"c3": [run("build"), run("freebsd / x86", "failure", suite=2),
+                                 run("freebsd / arm", status="in_progress", suite=2)]}
+        self.gh.workflow_runs = {"c3": [(1, "push"), (2, "schedule")]}
+        self.assertTrue(self.sync()[0].startswith("waiting"))
+        self.assertTrue(self.sync(ignore_events=["schedule"])[0].startswith("moved 3 commits to c3"))
+
+    def test_ignore_events_keeps_failing_push_runs(self):
+        self.gh.checks = {"c3": [run("build", "failure"), run("nightly", suite=2)]}
+        self.gh.workflow_runs = {"c3": [(1, "push"), (2, "schedule")]}
+        self.assertTrue(self.sync(ignore_events=["schedule"])[0].startswith("waiting"))
 
     def test_require_checks(self):
         self.gh.checks = {"c3": [run("lint")], "c2": [run("lint"), run("test (ubuntu)")]}

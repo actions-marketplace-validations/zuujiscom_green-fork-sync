@@ -24,7 +24,8 @@ first commit that:
 2. is at least `min-age-minutes` old (default 10), so every workflow has had time to start,
 3. has at least one check run or commit status,
 4. has every check run finished as **success**, **skipped** or **neutral**, with nothing
-   failed, cancelled, timed out or still running (names in `ignore-checks` are left out),
+   failed, cancelled, timed out or still running (names in `ignore-checks`, and runs of
+   workflows started by an event in `ignore-events`, are left out),
 5. has a combined commit status of success, if it has any statuses.
 
 The fork's branch is then fast-forwarded to that commit. If no newer commit qualifies yet,
@@ -120,6 +121,7 @@ remove the `dry-run` line; the schedule takes over from there.
 | `lookback` | `40` | How many recent upstream commits to consider (max 100). |
 | `ignore-checks` | | Check-run names to leave out of the decision, `*` wildcards allowed (for example a flaky job, or `Dependabot`). |
 | `require-checks` | | Check-run names that must be present and green, same format. |
+| `ignore-events` | | Leave out check runs of workflows started by these events, for example `schedule`: a nightly job on the branch tip otherwise adds its runs to a commit that was already green on push. |
 | `dry-run` | `false` | Only report what would move. |
 | `status-file` | | Also write the result table to this Markdown file (commit it yourself if you want it in the repo). |
 
