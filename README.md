@@ -31,6 +31,11 @@ first commit that:
 The fork's branch is then fast-forwarded to that commit. If no newer commit qualifies yet,
 the fork stays where it is and the next run tries again.
 
+With `docs-paths` set, newer commits that have no checks and only change matching files
+(say `*.md` or `.coderabbit.yaml`) are taken along too, as long as they sit directly on top
+of that green commit (or of the fork's current commit) with nothing failed, running or too
+new in between.
+
 Expect some waiting: busy projects often cancel CI on a commit when a newer push arrives,
 and commits that only touch docs are often skipped by `paths:` filters, so they have no
 checks. Those commits are passed over, and the fork moves on the next fully green one.
@@ -122,6 +127,7 @@ remove the `dry-run` line; the schedule takes over from there.
 | `ignore-checks` | | Check-run names to leave out of the decision, `*` wildcards allowed (for example a flaky job, or `Dependabot`). |
 | `require-checks` | | Check-run names that must be present and green, same format. |
 | `ignore-events` | | Leave out check runs of workflows started by these events, for example `schedule`: a nightly job on the branch tip otherwise adds its runs to a commit that was already green on push. |
+| `docs-paths` | | File patterns whose changes need no CI, `*` wildcards allowed (for example `*.md`, `.coderabbit.yaml`). Commits without checks that only change such files are taken along on top of the green commit. |
 | `dry-run` | `false` | Only report what would move. |
 | `status-file` | | Also write the result table to this Markdown file (commit it yourself if you want it in the repo). |
 

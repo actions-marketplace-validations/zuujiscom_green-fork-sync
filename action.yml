@@ -42,6 +42,9 @@ inputs:
   ignore-events:
     description: Leave out check runs of workflows started by these events (same format), e.g. `schedule` for nightly jobs.
     default: ""
+  docs-paths:
+    description: File patterns whose changes need no CI (same format), e.g. `*.md`, `.coderabbit.yaml`. Newer commits without checks that only change such files are taken along on top of the green commit.
+    default: ""
   dry-run:
     description: Only report what would move.
     default: "false"
@@ -75,6 +78,7 @@ runs:
         SYNC_IGNORE_CHECKS: ${{ inputs.ignore-checks }}
         SYNC_REQUIRE_CHECKS: ${{ inputs.require-checks }}
         SYNC_IGNORE_EVENTS: ${{ inputs.ignore-events }}
+        SYNC_DOCS_PATHS: ${{ inputs.docs-paths }}
         SYNC_DRY_RUN: ${{ inputs.dry-run }}
         SYNC_STATUS_FILE: ${{ inputs.status-file }}
       run: python3 "$GITHUB_ACTION_PATH/sync.py"

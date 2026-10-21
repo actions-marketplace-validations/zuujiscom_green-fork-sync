@@ -36,6 +36,7 @@ class FakeGitHub:
         self.checks = {}      # sha -> list of check runs
         self.statuses = {}    # sha -> (state, count)
         self.workflow_runs = {}  # sha -> list of (check suite id, event)
+        self.files = {}       # sha -> files the commit changes
         self.patches = []
         self.patch_error = None
 
@@ -77,15 +78,16 @@ class FakeGitHub:
             if base == head:
                 return reply({"status": "identical", "ahead_by": 0})
             if base in self.ancestors(head):
-                ahead = len(self.ancestors(head) - self.ancestors(base))
-                return reply({"status": "ahead", "ahead_by": ahead})
+                new = self.ancestors(head) - self.ancestors(base)
+                files = sorted({f for s in new for f in self.files.get(s, ["src/main.rs"])})
+                return reply({"status": "ahead", "ahead_by": len(new), "files": [{"filename": f} for f in files]})
             return reply({"status": "diverged", "ahead_by": 0})
         raise AssertionError(f"unexpected API call: {method} {path}")
 
 
 def cfg(**kw):
     base = dict(upstream="up", fork="fork", branch="main", fork_branch="main", min_age=10,
-                lookback=40, ignore_checks=[], require_checks=[], ignore_events=[], dry_run=False)
+                lookback=40, ignore_checks=[], require_checks=[], ignore_events=[], docs_paths=[], dry_run=False)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -170,6 +172,50 @@ class SyncTests(unittest.TestCase):
         self.gh.checks = {"c3": [run("build", "failure"), run("nightly", suite=2)]}
         self.gh.workflow_runs = {"c3": [(1, "push"), (2, "schedule")]}
         self.assertTrue(self.sync(ignore_events=["schedule"])[0].startswith("waiting"))
+
+    def test_docs_only_commits_on_top_of_green_are_taken(self):
+        self.gh.checks = {"c1": [run("build")]}
+        self.gh.files = {"c3": [".coderabbit.yaml"], "c2": ["README.md", "docs/a.md"]}
+        self.assertTrue(self.sync(dry_run=True)[0].startswith("would move 1 commits to c1"))
+        result = self.sync(docs_paths=["*.md", ".coderabbit.yaml"])[0]
+        self.assertTrue(result.startswith("moved 3 commits to c3 (docs only on top of c1"), result)
+
+    def test_docs_run_stops_at_a_code_commit(self):
+        self.gh.checks = {"c1": [run("build")]}
+        self.gh.files = {"c3": ["README.md"]}  # c2 has no checks and changes code
+        result = self.sync(docs_paths=["*.md"])[0]
+        self.assertTrue(result.startswith("moved 1 commits to c1 ("), result)
+
+    def test_docs_run_must_sit_directly_on_green(self):
+        # c3 docs-only, c2 failed, c1 green: c3 is not taken
+        self.gh.checks = {"c2": [run("build", "failure")], "c1": [run("build")]}
+        self.gh.files = {"c3": ["README.md"]}
+        result = self.sync(docs_paths=["*.md"])[0]
+        self.assertTrue(result.startswith("moved 1 commits to c1 ("), result)
+
+    def test_too_new_docs_commit_waits(self):
+        self.gh.commits[0] = ("c3", ["c2"], NEW)
+        self.gh.checks = {"c2": [run("build")]}
+        self.gh.files = {"c3": ["README.md"]}
+        self.assertTrue(self.sync(docs_paths=["*.md"])[0].startswith("moved 2 commits to c2 ("))
+
+    def test_docs_only_on_top_of_fork_commit_are_taken(self):
+        self.gh.fork_sha = "c1"
+        self.gh.files = {"c3": [".coderabbit.yaml"], "c2": ["README.md"]}
+        self.assertTrue(self.sync()[0].startswith("waiting"))
+        result, before, after = self.sync(docs_paths=["*.md", ".coderabbit.yaml"])
+        self.assertTrue(result.startswith("moved 2 commits to c3 (docs only on top of c1"), result)
+        self.assertEqual(self.gh.patches, [{"sha": "c3", "force": False}])
+
+    def test_code_commit_above_fork_blocks_docs(self):
+        self.gh.fork_sha = "c1"
+        self.gh.files = {"c3": ["README.md"]}  # c2 changes code, no checks
+        self.assertTrue(self.sync(docs_paths=["*.md"])[0].startswith("waiting"))
+
+    def test_docs_only_above_failed_commit_waits(self):
+        self.gh.checks = {"c1": [run("build", "failure")]}
+        self.gh.files = {"c3": ["README.md"], "c2": ["README.md"]}
+        self.assertTrue(self.sync(docs_paths=["*.md"])[0].startswith("waiting"))
 
     def test_require_checks(self):
         self.gh.checks = {"c3": [run("lint")], "c2": [run("lint"), run("test (ubuntu)")]}

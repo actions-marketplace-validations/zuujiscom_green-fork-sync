@@ -9,7 +9,8 @@ itself pointed at, not commits from merged PR branches) and pick the newest comm
     cancelled, timed out or still running), ignoring names matched by --ignore-check and
     runs of workflows started by an --ignore-event (for example nightly `schedule` runs),
   - has a combined commit status of success, if it has any statuses.
-The fork's branch is then fast-forwarded to it. Nothing is ever force-pushed: a fork with
+The fork's branch is then fast-forwarded to it. With --docs-path, newer commits that have no
+checks and only change matching files (README, .coderabbit.yaml, ...) are taken along too. Nothing is ever force-pushed: a fork with
 commits of its own is reported and left alone.
 
 API calls go through the `gh` CLI (GH_TOKEN in Actions, the local gh login otherwise).
@@ -83,6 +84,17 @@ class Syncer:
             return False, f"status {status['state']}"
         return True, f"{len(runs)} checks green"
 
+    def docs_only(self, repo, commit):
+        """True if the commit (against its first parent) only changes files matching --docs-path."""
+        if not commit["parents"]:
+            return False
+        cmp = api(f"repos/{self.c.upstream}/{repo}/compare/{commit['parents'][0]['sha']}...{commit['sha']}")
+        files = cmp.get("files") or []
+        if not files or len(files) >= 300:  # compare lists at most 300 files
+            return False
+        paths = [p for f in files for p in (f["filename"], f.get("previous_filename")) if p]
+        return all(any(fnmatch.fnmatch(p, pat) for pat in self.c.docs_paths) for p in paths)
+
     def push_with_git(self, repo, sha):
         """Fallback when the commit isn't in the fork's object store yet (repos that GitHub
         doesn't link as a fork). Fetch from upstream, push without force."""
@@ -96,6 +108,18 @@ class Syncer:
             git("fetch", "-q", f"https://github.com/{self.c.upstream}/{repo}.git", sha)
             git("-c", f"http.extraheader=AUTHORIZATION: basic {auth}", "push", "-q",
                 f"https://github.com/{self.c.fork}/{repo}.git", f"{sha}:refs/heads/{self.c.fork_branch}")
+
+    def move(self, repo, fork_sha, sha, ahead, why):
+        c = self.c
+        if c.dry_run:
+            return f"would move {ahead} commits to {sha[:8]} ({why})", fork_sha, sha
+        _, err = api(f"repos/{c.fork}/{repo}/git/refs/heads/{c.fork_branch}", "PATCH",
+                     {"sha": sha, "force": False}, ok_codes=True)
+        if err:
+            if "Object does not exist" not in err and "422" not in err:
+                raise RuntimeError(err[:300])
+            self.push_with_git(repo, sha)
+        return f"moved {ahead} commits to {sha[:8]} ({why})", fork_sha, sha
 
     def sync(self, repo):
         c = self.c
@@ -111,18 +135,33 @@ class Syncer:
             cur = by_sha.get(parents[0]["sha"]) if parents else None
         now = dt.datetime.now(dt.timezone.utc)
         notes = []
+        docs_tip = None  # newest of the unchecked docs-only commits directly above the current one
         for commit in chain:
             sha = commit["sha"]
             if sha == fork_sha:
-                break
+                if not docs_tip:
+                    break
+                # Only unchecked docs commits since the fork's commit: take them along.
+                sha, why = docs_tip, f"docs only on top of {fork_sha[:8]}"
+                cmp = api(f"repos/{c.upstream}/{repo}/compare/{fork_sha}...{sha}")
+                return self.move(repo, fork_sha, sha, cmp["ahead_by"], why)
             when = dt.datetime.fromisoformat(commit["commit"]["committer"]["date"].replace("Z", "+00:00"))
             if now - when < dt.timedelta(minutes=c.min_age):
                 notes.append(f"{sha[:8]} too new")
+                docs_tip = None
                 continue
             ok, why = self.green(repo, sha)
             if not ok:
-                notes.append(f"{sha[:8]} {why}")
+                if why == "no checks" and c.docs_paths and self.docs_only(repo, commit):
+                    docs_tip = docs_tip or sha
+                    notes.append(f"{sha[:8]} docs only")
+                else:
+                    notes.append(f"{sha[:8]} {why}")
+                    docs_tip = None
                 continue
+            if docs_tip:
+                why = f"docs only on top of {sha[:8]}, {why}"
+                sha = docs_tip
             cmp = api(f"repos/{c.upstream}/{repo}/compare/{fork_sha}...{sha}")
             if cmp["status"] != "ahead":
                 tip = api(f"repos/{c.upstream}/{repo}/compare/{fork_sha}...{chain[0]['sha']}")
@@ -130,15 +169,7 @@ class Syncer:
                     return "fork has diverged from upstream, not touching it", fork_sha, None
                 notes.append(f"{sha[:8]} not a fast-forward")
                 continue
-            if c.dry_run:
-                return f"would move {cmp['ahead_by']} commits to {sha[:8]} ({why})", fork_sha, sha
-            _, err = api(f"repos/{c.fork}/{repo}/git/refs/heads/{c.fork_branch}", "PATCH",
-                         {"sha": sha, "force": False}, ok_codes=True)
-            if err:
-                if "Object does not exist" not in err and "422" not in err:
-                    raise RuntimeError(err[:300])
-                self.push_with_git(repo, sha)
-            return f"moved {cmp['ahead_by']} commits to {sha[:8]} ({why})", fork_sha, sha
+            return self.move(repo, fork_sha, sha, cmp["ahead_by"], why)
         return "waiting: no newer green commit (" + "; ".join(notes[:3]) + ")", fork_sha, None
 
 
@@ -168,6 +199,8 @@ def main():
                     help="check-run name pattern that must be present (repeatable)")
     ap.add_argument("--ignore-event", dest="ignore_events", action="append", default=split_list(env("SYNC_IGNORE_EVENTS")),
                     help="leave out check runs of workflows started by this event, e.g. schedule (repeatable)")
+    ap.add_argument("--docs-path", dest="docs_paths", action="append", default=split_list(env("SYNC_DOCS_PATHS")),
+                    help="file pattern whose changes need no CI, e.g. *.md (repeatable)")
     ap.add_argument("--dry-run", action="store_true", default=(env("SYNC_DRY_RUN") or "").lower() == "true")
     ap.add_argument("--status", default=env("SYNC_STATUS_FILE") or "", help="write a Markdown status table here")
     c = ap.parse_args()
