@@ -26,7 +26,8 @@ checks all passed. Users call it from their own workflow with `uses: zuujiscom/g
   `action.yml`, its `SYNC_*` variable and argparse flag in `sync.py`, and the inputs
   table in `README.md`.
 - A commit is green only if it has at least one check and nothing is failed, cancelled or
-  still running. Don't loosen this by default; add an opt-in input instead.
+  still running, counting both check runs and workflow runs (a workflow cancelled or queued
+  before its jobs start leaves no check runs). Don't loosen this by default; add an opt-in input instead.
 - One repo failing must not stop the others: errors are caught per repo, counted in the
   `failed` output, and make the step fail at the end.
 
@@ -39,7 +40,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 Add a test for every behaviour change: the fake in `tests/test_sync.py` (`FakeGitHub`)
-models commits with parents, check runs, commit statuses, compare and the ref update.
+models commits with parents, check runs, workflow runs, commit statuses, compare and the ref update.
 `MetadataTests` fail if `action.yml`, the `SYNC_*` variables in `sync.py` and the README
 inputs table drift apart, so update all three together.
 

@@ -26,7 +26,13 @@ first commit that:
 4. has every check run finished as **success**, **skipped** or **neutral**, with nothing
    failed, cancelled, timed out or still running (names in `ignore-checks`, and runs of
    workflows started by an event in `ignore-events`, are left out),
-5. has a combined commit status of success, if it has any statuses.
+5. has every GitHub Actions workflow run for it finished the same way. This catches a
+   workflow that was cancelled, or is still queued, before any of its jobs reported a check
+   run, which would otherwise leave only the other workflows' passing checks to look at.
+   Workflows started by an `ignore-events` event or whose name matches `ignore-checks` are
+   left out, and so is a workflow that is unfinished or failed only because of an ignored
+   job,
+6. has a combined commit status of success, if it has any statuses.
 
 The fork's branch is then fast-forwarded to that commit. If no newer commit qualifies yet,
 the fork stays where it is and the next run tries again.
@@ -124,7 +130,7 @@ remove the `dry-run` line; the schedule takes over from there.
 | `fork-branch` | same as `branch` | Branch in the fork to move. |
 | `min-age-minutes` | `10` | Skip upstream commits newer than this. |
 | `lookback` | `40` | How many recent upstream commits to consider (max 100). |
-| `ignore-checks` | | Check-run names to leave out of the decision, `*` wildcards allowed (for example a flaky job, or `Dependabot`). |
+| `ignore-checks` | | Check-run and workflow names to leave out of the decision, `*` wildcards allowed (for example a flaky job, or `Dependabot`). |
 | `require-checks` | | Check-run names that must be present and green, same format. |
 | `ignore-events` | | Leave out check runs of workflows started by these events, for example `schedule`: a nightly job on the branch tip otherwise adds its runs to a commit that was already green on push. |
 | `docs-paths` | | File patterns whose changes need no CI, `*` wildcards allowed (for example `*.md`, `.coderabbit.yaml`). Commits without checks that only change such files are taken along on top of the green commit. |

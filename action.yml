@@ -34,7 +34,7 @@ inputs:
     description: How many recent upstream commits to consider (max 100).
     default: "40"
   ignore-checks:
-    description: Check-run names to ignore (one per line or comma-separated, * wildcards), e.g. flaky jobs.
+    description: Check-run and workflow names to ignore (one per line or comma-separated, * wildcards), e.g. flaky jobs.
     default: ""
   require-checks:
     description: Check-run names that must be present and green (same format).
