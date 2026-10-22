@@ -6,9 +6,13 @@ itself pointed at, not commits from merged PR branches) and pick the newest comm
   - is at least --min-age minutes old, so every workflow has had time to start,
   - has at least one check run or commit status,
   - has every check run finished as success, skipped or neutral (nothing failed,
-    cancelled, timed out or still running), ignoring names matched by --ignore-check,
+    cancelled, timed out or still running), ignoring names matched by --ignore-check and
+    runs of workflows started by an --ignore-event (for example nightly `schedule` runs),
+  - has every workflow run for it finished the same way, even one cancelled or queued before
+    any job reported (same exceptions; --ignore-check also matches workflow names),
   - has a combined commit status of success, if it has any statuses.
-The fork's branch is then fast-forwarded to it. Nothing is ever force-pushed: a fork with
+The fork's branch is then fast-forwarded to it. With --docs-path, newer commits that have no
+checks and only change matching files (README, .coderabbit.yaml, ...) are taken along too. Nothing is ever force-pushed: a fork with
 commits of its own is reported and left alone.
 
 API calls go through the `gh` CLI (GH_TOKEN in Actions, the local gh login otherwise).
@@ -50,15 +54,46 @@ class Syncer:
     def green(self, repo, sha):
         """Return (is_green, reason) for an upstream commit."""
         up = self.c.upstream
-        runs = []
-        page = 1
-        while True:  # big repos can have more than 100 check runs on one commit
-            got = api(f"repos/{up}/{repo}/commits/{sha}/check-runs?per_page=100&page={page}&filter=latest")
-            runs += got["check_runs"]
-            if len(got["check_runs"]) < 100:
-                break
-            page += 1
-        runs = [c for c in runs if not any(fnmatch.fnmatch(c["name"], p) for p in self.c.ignore_checks)]
+
+        def ignored(name):
+            return any(fnmatch.fnmatch(name, p) for p in self.c.ignore_checks)
+
+        def pages(path, key):  # either list can pass 100 on a big repo
+            out, page = [], 1
+            while True:
+                got = api(f"{path}per_page=100&page={page}")[key]
+                out += got
+                if len(got) < 100:
+                    return out
+                page += 1
+        every = pages(f"repos/{up}/{repo}/commits/{sha}/check-runs?filter=latest&", "check_runs")
+        runs = [c for c in every if not ignored(c["name"])]
+        # Workflow runs too: one cancelled or still queued before any job started leaves no
+        # check runs behind, so the commit's other checks alone would look green.
+        workflows = pages(f"repos/{up}/{repo}/actions/runs?head_sha={sha}&", "workflow_runs")
+        # A nightly workflow on the branch tip adds its check runs to a commit that was
+        # already green on push; leave runs from the ignored events out.
+        skip = {w["check_suite_id"] for w in workflows if w["event"] in self.c.ignore_events}
+        runs = [c for c in runs if c.get("check_suite", {}).get("id") not in skip]
+        latest = {}
+        for w in workflows:
+            if w["event"] not in self.c.ignore_events and not ignored(w["name"]):
+                if w["workflow_id"] not in latest or w["id"] > latest[w["workflow_id"]]["id"]:
+                    latest[w["workflow_id"]] = w
+        wf_running, wf_bad = [], []
+        for w in latest.values():
+            name = w["name"] if len(w["name"]) <= 40 else w["name"][:39] + "…"  # Dependabot's are long
+            # A workflow kept open, or failed, only by an ignored job doesn't count.
+            mine = [c for c in every if c.get("check_suite", {}).get("id") == w["check_suite_id"] and ignored(c["name"])]
+            if w["status"] != "completed":
+                if not any(c["status"] != "completed" for c in mine):
+                    wf_running.append(name)
+            elif w["conclusion"] not in GOOD and not any(c["conclusion"] not in GOOD for c in mine):
+                wf_bad.append(f'{name}={w["conclusion"]}')
+        if wf_running:
+            return False, "workflow running: " + ", ".join(sorted(wf_running)[:3])
+        if wf_bad:
+            return False, "workflow not green: " + ", ".join(sorted(wf_bad)[:3])
         status = api(f"repos/{up}/{repo}/commits/{sha}/status")
         if not runs and status["total_count"] == 0:
             return False, "no checks"
@@ -76,6 +111,17 @@ class Syncer:
             return False, f"status {status['state']}"
         return True, f"{len(runs)} checks green"
 
+    def docs_only(self, repo, commit):
+        """True if the commit (against its first parent) only changes files matching --docs-path."""
+        if not commit["parents"]:
+            return False
+        cmp = api(f"repos/{self.c.upstream}/{repo}/compare/{commit['parents'][0]['sha']}...{commit['sha']}")
+        files = cmp.get("files") or []
+        if not files or len(files) >= 300:  # compare lists at most 300 files
+            return False
+        paths = [p for f in files for p in (f["filename"], f.get("previous_filename")) if p]
+        return all(any(fnmatch.fnmatch(p, pat) for pat in self.c.docs_paths) for p in paths)
+
     def push_with_git(self, repo, sha):
         """Fallback when the commit isn't in the fork's object store yet (repos that GitHub
         doesn't link as a fork). Fetch from upstream, push without force."""
@@ -89,6 +135,18 @@ class Syncer:
             git("fetch", "-q", f"https://github.com/{self.c.upstream}/{repo}.git", sha)
             git("-c", f"http.extraheader=AUTHORIZATION: basic {auth}", "push", "-q",
                 f"https://github.com/{self.c.fork}/{repo}.git", f"{sha}:refs/heads/{self.c.fork_branch}")
+
+    def move(self, repo, fork_sha, sha, ahead, why):
+        c = self.c
+        if c.dry_run:
+            return f"would move {ahead} commits to {sha[:8]} ({why})", fork_sha, sha
+        _, err = api(f"repos/{c.fork}/{repo}/git/refs/heads/{c.fork_branch}", "PATCH",
+                     {"sha": sha, "force": False}, ok_codes=True)
+        if err:
+            if "Object does not exist" not in err and "422" not in err:
+                raise RuntimeError(err[:300])
+            self.push_with_git(repo, sha)
+        return f"moved {ahead} commits to {sha[:8]} ({why})", fork_sha, sha
 
     def sync(self, repo):
         c = self.c
@@ -104,18 +162,33 @@ class Syncer:
             cur = by_sha.get(parents[0]["sha"]) if parents else None
         now = dt.datetime.now(dt.timezone.utc)
         notes = []
+        docs_tip = None  # newest of the unchecked docs-only commits directly above the current one
         for commit in chain:
             sha = commit["sha"]
             if sha == fork_sha:
-                break
+                if not docs_tip:
+                    break
+                # Only unchecked docs commits since the fork's commit: take them along.
+                sha, why = docs_tip, f"docs only on top of {fork_sha[:8]}"
+                cmp = api(f"repos/{c.upstream}/{repo}/compare/{fork_sha}...{sha}")
+                return self.move(repo, fork_sha, sha, cmp["ahead_by"], why)
             when = dt.datetime.fromisoformat(commit["commit"]["committer"]["date"].replace("Z", "+00:00"))
             if now - when < dt.timedelta(minutes=c.min_age):
                 notes.append(f"{sha[:8]} too new")
+                docs_tip = None
                 continue
             ok, why = self.green(repo, sha)
             if not ok:
-                notes.append(f"{sha[:8]} {why}")
+                if why == "no checks" and c.docs_paths and self.docs_only(repo, commit):
+                    docs_tip = docs_tip or sha
+                    notes.append(f"{sha[:8]} docs only")
+                else:
+                    notes.append(f"{sha[:8]} {why}")
+                    docs_tip = None
                 continue
+            if docs_tip:
+                why = f"docs only on top of {sha[:8]}, {why}"
+                sha = docs_tip
             cmp = api(f"repos/{c.upstream}/{repo}/compare/{fork_sha}...{sha}")
             if cmp["status"] != "ahead":
                 tip = api(f"repos/{c.upstream}/{repo}/compare/{fork_sha}...{chain[0]['sha']}")
@@ -123,15 +196,7 @@ class Syncer:
                     return "fork has diverged from upstream, not touching it", fork_sha, None
                 notes.append(f"{sha[:8]} not a fast-forward")
                 continue
-            if c.dry_run:
-                return f"would move {cmp['ahead_by']} commits to {sha[:8]} ({why})", fork_sha, sha
-            _, err = api(f"repos/{c.fork}/{repo}/git/refs/heads/{c.fork_branch}", "PATCH",
-                         {"sha": sha, "force": False}, ok_codes=True)
-            if err:
-                if "Object does not exist" not in err and "422" not in err:
-                    raise RuntimeError(err[:300])
-                self.push_with_git(repo, sha)
-            return f"moved {cmp['ahead_by']} commits to {sha[:8]} ({why})", fork_sha, sha
+            return self.move(repo, fork_sha, sha, cmp["ahead_by"], why)
         return "waiting: no newer green commit (" + "; ".join(notes[:3]) + ")", fork_sha, None
 
 
@@ -156,9 +221,13 @@ def main():
     ap.add_argument("--min-age", type=int, default=int(env("SYNC_MIN_AGE") or 10), help="minutes")
     ap.add_argument("--lookback", type=int, default=int(env("SYNC_LOOKBACK") or 40), help="upstream commits to scan (max 100)")
     ap.add_argument("--ignore-check", dest="ignore_checks", action="append", default=split_list(env("SYNC_IGNORE_CHECKS")),
-                    help="check-run name pattern to ignore (repeatable, * wildcards)")
+                    help="check-run or workflow name pattern to ignore (repeatable, * wildcards)")
     ap.add_argument("--require-check", dest="require_checks", action="append", default=split_list(env("SYNC_REQUIRE_CHECKS")),
                     help="check-run name pattern that must be present (repeatable)")
+    ap.add_argument("--ignore-event", dest="ignore_events", action="append", default=split_list(env("SYNC_IGNORE_EVENTS")),
+                    help="leave out check runs of workflows started by this event, e.g. schedule (repeatable)")
+    ap.add_argument("--docs-path", dest="docs_paths", action="append", default=split_list(env("SYNC_DOCS_PATHS")),
+                    help="file pattern whose changes need no CI, e.g. *.md (repeatable)")
     ap.add_argument("--dry-run", action="store_true", default=(env("SYNC_DRY_RUN") or "").lower() == "true")
     ap.add_argument("--status", default=env("SYNC_STATUS_FILE") or "", help="write a Markdown status table here")
     c = ap.parse_args()

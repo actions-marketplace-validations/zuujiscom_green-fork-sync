@@ -20,8 +20,14 @@ def read(name):
         return f.read()
 
 
-def run(name, conclusion="success", status="completed"):
-    return {"name": name, "status": status, "conclusion": conclusion if status == "completed" else None}
+def run(name, conclusion="success", status="completed", suite=1):
+    return {"name": name, "status": status, "conclusion": conclusion if status == "completed" else None,
+            "check_suite": {"id": suite}}
+
+
+def wf(name, conclusion="success", status="completed", suite=1, event="push", run_id=None, workflow=None):
+    return {"name": name, "status": status, "conclusion": conclusion if status == "completed" else None,
+            "check_suite_id": suite, "event": event, "id": run_id or suite, "workflow_id": workflow or name}
 
 
 class FakeGitHub:
@@ -34,6 +40,8 @@ class FakeGitHub:
         self.fork_sha = fork_sha
         self.checks = {}      # sha -> list of check runs
         self.statuses = {}    # sha -> (state, count)
+        self.workflow_runs = {}  # sha -> list of (check suite id, event) or wf() dicts
+        self.files = {}       # sha -> files the commit changes
         self.patches = []
         self.patch_error = None
 
@@ -61,9 +69,14 @@ class FakeGitHub:
         if re.fullmatch(r"repos/up/r/commits\?sha=main&per_page=\d+", path):
             return reply([{"sha": s, "parents": [{"sha": p} for p in ps], "commit": {"committer": {"date": d}}}
                           for s, ps, d in self.commits])
-        if m := re.fullmatch(r"repos/up/r/commits/(\w+)/check-runs\?per_page=100&page=(\d+)&filter=latest", path):
+        if m := re.fullmatch(r"repos/up/r/commits/(\w+)/check-runs\?filter=latest&per_page=100&page=(\d+)", path):
             runs, page = self.checks.get(m[1], []), int(m[2])
             return reply({"check_runs": runs[(page - 1) * 100:page * 100]})
+        if m := re.fullmatch(r"repos/up/r/actions/runs\?head_sha=(\w+)&per_page=100&page=(\d+)", path):
+            runs = [w if isinstance(w, dict) else wf(f"wf{w[0]}", suite=w[0], event=w[1])
+                    for w in self.workflow_runs.get(m[1], [])]
+            page = int(m[2])
+            return reply({"workflow_runs": runs[(page - 1) * 100:page * 100]})
         if m := re.fullmatch(r"repos/up/r/commits/(\w+)/status", path):
             state, count = self.statuses.get(m[1], ("pending", 0))
             return reply({"state": state, "total_count": count})
@@ -72,15 +85,16 @@ class FakeGitHub:
             if base == head:
                 return reply({"status": "identical", "ahead_by": 0})
             if base in self.ancestors(head):
-                ahead = len(self.ancestors(head) - self.ancestors(base))
-                return reply({"status": "ahead", "ahead_by": ahead})
+                new = self.ancestors(head) - self.ancestors(base)
+                files = sorted({f for s in new for f in self.files.get(s, ["src/main.rs"])})
+                return reply({"status": "ahead", "ahead_by": len(new), "files": [{"filename": f} for f in files]})
             return reply({"status": "diverged", "ahead_by": 0})
         raise AssertionError(f"unexpected API call: {method} {path}")
 
 
 def cfg(**kw):
     base = dict(upstream="up", fork="fork", branch="main", fork_branch="main", min_age=10,
-                lookback=40, ignore_checks=[], require_checks=[], dry_run=False)
+                lookback=40, ignore_checks=[], require_checks=[], ignore_events=[], docs_paths=[], dry_run=False)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -152,6 +166,118 @@ class SyncTests(unittest.TestCase):
     def test_only_ignored_checks_counts_as_no_checks(self):
         self.gh.checks = {"c3": [run("Dependabot")]}
         self.assertIn("no checks", self.sync(ignore_checks=["Dependabot"])[0])
+
+    def test_ignore_events_drops_scheduled_runs(self):
+        # c3 was green on push, then a nightly run on the branch tip failed / is still running
+        self.gh.checks = {"c3": [run("build"), run("freebsd / x86", "failure", suite=2),
+                                 run("freebsd / arm", status="in_progress", suite=2)]}
+        self.gh.workflow_runs = {"c3": [(1, "push"), (2, "schedule")]}
+        self.assertTrue(self.sync()[0].startswith("waiting"))
+        self.assertTrue(self.sync(ignore_events=["schedule"])[0].startswith("moved 3 commits to c3"))
+
+    def test_ignore_events_keeps_failing_push_runs(self):
+        self.gh.checks = {"c3": [run("build", "failure"), run("nightly", suite=2)]}
+        self.gh.workflow_runs = {"c3": [(1, "push"), (2, "schedule")]}
+        self.assertTrue(self.sync(ignore_events=["schedule"])[0].startswith("waiting"))
+
+    def test_cancelled_workflow_without_check_runs_is_not_green(self):
+        # c3: CI was cancelled before any job reported; only another workflow's checks passed
+        self.gh.checks = {"c3": [run("lint / lint", suite=2)], "c2": [run("build")]}
+        self.gh.workflow_runs = {"c3": [wf("CI", "cancelled", suite=1), wf("Packaging lint", suite=2)],
+                                 "c2": [wf("CI")]}
+        result = self.sync()[0]
+        self.assertTrue(result.startswith("moved 2 commits to c2"), result)
+        self.gh.fork_sha = "c0"
+        self.gh.checks.pop("c2")
+        self.assertIn("c3 workflow not green: CI=cancelled", self.sync()[0])
+
+    def test_queued_workflow_without_check_runs_waits(self):
+        self.gh.checks = {"c3": [run("SonarCloud Scan", suite=2)]}
+        self.gh.workflow_runs = {"c3": [wf("CI", status="pending", suite=1), wf("SonarCloud", suite=2)]}
+        result, _, after = self.sync(ignore_checks=["*SonarCloud*"])
+        self.assertIn("c3 workflow running: CI", result)
+        self.assertIsNone(after)
+
+    def test_cancelled_workflow_blocks_docs_only_commit(self):
+        self.gh.checks = {"c2": [run("build")]}
+        self.gh.files = {"c3": ["README.md"]}
+        self.gh.workflow_runs = {"c3": [wf("CI", "cancelled")]}
+        self.assertTrue(self.sync(docs_paths=["*.md"])[0].startswith("moved 2 commits to c2 ("))
+
+    def test_ignored_workflows_and_events_do_not_block(self):
+        self.gh.checks = {"c3": [run("build")]}
+        self.gh.workflow_runs = {"c3": [wf("CI"), wf("FreeBSD", "cancelled", suite=2),
+                                        wf("Nightly", status="in_progress", suite=3, event="schedule")]}
+        self.assertTrue(self.sync()[0].startswith("waiting"))
+        result = self.sync(ignore_checks=["*FreeBSD*"], ignore_events=["schedule"])[0]
+        self.assertTrue(result.startswith("moved 3 commits to c3"), result)
+
+    def test_workflow_held_up_only_by_ignored_job_does_not_block(self):
+        # CI's FreeBSD job is ignored; it failed (or is still running) while the rest passed
+        self.gh.checks = {"c3": [run("build"), run("freebsd / x86", "failure")],
+                          "c2": [run("build"), run("freebsd / x86", status="in_progress")]}
+        self.gh.workflow_runs = {"c3": [wf("CI", "failure")], "c2": [wf("CI", status="in_progress")]}
+        self.assertTrue(self.sync()[0].startswith("waiting"))
+        self.assertTrue(self.sync(ignore_checks=["freebsd*"])[0].startswith("moved 3 commits to c3"))
+        self.gh.fork_sha = "c0"
+        self.gh.workflow_runs["c3"] = [wf("CI", "cancelled")]  # cancelled, but not by the ignored job
+        self.gh.checks["c3"] = [run("build"), run("freebsd / x86")]
+        self.assertTrue(self.sync(ignore_checks=["freebsd*"])[0].startswith("moved 2 commits to c2"))
+
+    def test_only_the_newest_run_of_a_workflow_counts(self):
+        self.gh.checks = {"c3": [run("build", suite=2)]}
+        self.gh.workflow_runs = {"c3": [wf("CI", "cancelled", suite=1, run_id=10),
+                                        wf("CI", suite=2, run_id=11, event="workflow_dispatch")]}
+        self.assertTrue(self.sync()[0].startswith("moved 3 commits to c3"))
+
+    def test_workflow_runs_are_paginated(self):
+        self.gh.checks = {"c3": [run("build")]}
+        self.gh.workflow_runs = {"c3": [wf(f"w{i}", suite=i + 1) for i in range(100)] + [wf("late", "failure", suite=200)]}
+        self.assertIn("late=failure", self.sync()[0])
+
+    def test_docs_only_commits_on_top_of_green_are_taken(self):
+        self.gh.checks = {"c1": [run("build")]}
+        self.gh.files = {"c3": [".coderabbit.yaml"], "c2": ["README.md", "docs/a.md"]}
+        self.assertTrue(self.sync(dry_run=True)[0].startswith("would move 1 commits to c1"))
+        result = self.sync(docs_paths=["*.md", ".coderabbit.yaml"])[0]
+        self.assertTrue(result.startswith("moved 3 commits to c3 (docs only on top of c1"), result)
+
+    def test_docs_run_stops_at_a_code_commit(self):
+        self.gh.checks = {"c1": [run("build")]}
+        self.gh.files = {"c3": ["README.md"]}  # c2 has no checks and changes code
+        result = self.sync(docs_paths=["*.md"])[0]
+        self.assertTrue(result.startswith("moved 1 commits to c1 ("), result)
+
+    def test_docs_run_must_sit_directly_on_green(self):
+        # c3 docs-only, c2 failed, c1 green: c3 is not taken
+        self.gh.checks = {"c2": [run("build", "failure")], "c1": [run("build")]}
+        self.gh.files = {"c3": ["README.md"]}
+        result = self.sync(docs_paths=["*.md"])[0]
+        self.assertTrue(result.startswith("moved 1 commits to c1 ("), result)
+
+    def test_too_new_docs_commit_waits(self):
+        self.gh.commits[0] = ("c3", ["c2"], NEW)
+        self.gh.checks = {"c2": [run("build")]}
+        self.gh.files = {"c3": ["README.md"]}
+        self.assertTrue(self.sync(docs_paths=["*.md"])[0].startswith("moved 2 commits to c2 ("))
+
+    def test_docs_only_on_top_of_fork_commit_are_taken(self):
+        self.gh.fork_sha = "c1"
+        self.gh.files = {"c3": [".coderabbit.yaml"], "c2": ["README.md"]}
+        self.assertTrue(self.sync()[0].startswith("waiting"))
+        result, before, after = self.sync(docs_paths=["*.md", ".coderabbit.yaml"])
+        self.assertTrue(result.startswith("moved 2 commits to c3 (docs only on top of c1"), result)
+        self.assertEqual(self.gh.patches, [{"sha": "c3", "force": False}])
+
+    def test_code_commit_above_fork_blocks_docs(self):
+        self.gh.fork_sha = "c1"
+        self.gh.files = {"c3": ["README.md"]}  # c2 changes code, no checks
+        self.assertTrue(self.sync(docs_paths=["*.md"])[0].startswith("waiting"))
+
+    def test_docs_only_above_failed_commit_waits(self):
+        self.gh.checks = {"c1": [run("build", "failure")]}
+        self.gh.files = {"c3": ["README.md"], "c2": ["README.md"]}
+        self.assertTrue(self.sync(docs_paths=["*.md"])[0].startswith("waiting"))
 
     def test_require_checks(self):
         self.gh.checks = {"c3": [run("lint")], "c2": [run("lint"), run("test (ubuntu)")]}
